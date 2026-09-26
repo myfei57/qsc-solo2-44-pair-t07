@@ -15,6 +15,11 @@ class Watermark:
     tick: int = 0
     snapshot_seq: int = 0
 
+    def lag(self) -> int:
+        """How many durable records are still waiting on a commit."""
+
+        return self.durable_seq - self.committed_seq
+
     def describe(self) -> dict[str, Any]:
         return {
             "committed_seq": self.committed_seq,

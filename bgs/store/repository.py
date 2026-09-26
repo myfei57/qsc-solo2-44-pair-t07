@@ -19,6 +19,12 @@ from .tombstone import effective_records, rollback_targets
 from .watermark import Watermark
 
 
+def advance_watermark(current: int, candidate: int) -> int:
+    """A high watermark only ever moves forward."""
+
+    return max(current, candidate)
+
+
 @dataclass(frozen=True, slots=True)
 class RestoreReport:
     """What a restart decided to do."""
@@ -78,9 +84,26 @@ class RecordRepository:
         return self._snapshots
 
     def _load_backend(self) -> None:
+        """Replay the durable journal.
+
+        ``append`` lines rebuild the record list, including records that never
+        reached a commit; those stay in the stream but past the commit
+        watermark, exactly as they were when the process died.  ``durable``
+        and ``commit`` lines rebuild the two watermarks, so a restart resumes
+        at the position that was truly on disk instead of trusting the tail.
+        """
+
+        durable_seq = 0
+        committed_seq = 0
         for entry in self._backend.read():
             if entry.entry_type == ENTRY_APPEND and entry.record is not None:
                 self._records.append(entry.record)
+            elif entry.entry_type == ENTRY_DURABLE and entry.seq is not None:
+                durable_seq = advance_watermark(durable_seq, entry.seq)
+            elif entry.entry_type == ENTRY_COMMIT and entry.seq is not None:
+                committed_seq = advance_watermark(committed_seq, entry.seq)
+        self._durable_seq = min(durable_seq, len(self._records))
+        self._committed_seq = min(committed_seq, self._durable_seq)
 
     def _append_entry(self, entry: JournalEntry) -> None:
         self._backend.append(entry)
@@ -114,13 +137,24 @@ class RecordRepository:
         )
         self._records.append(record)
         self._append_entry(JournalEntry(entry_type=ENTRY_APPEND, tick=record.tick, record=record))
-        self._committed_seq = record.seq
         return record
 
     def flush(self) -> Watermark:
-        """Make every staged record durable."""
+        """Make every staged record durable.
 
+        The records and the ``durable`` watermark line reach disk together in
+        one fsync: a reader reopening the backend only treats the tail as
+        durable when that marker survived the kill.
+        """
+
+        if not self.staged_records():
+            return self.watermark()
+        through = len(self._records)
+        self._append_entry(
+            JournalEntry(entry_type=ENTRY_DURABLE, tick=self._clock.now(), seq=through)
+        )
         self._backend.flush_now()
+        self._durable_seq = advance_watermark(self._durable_seq, through)
         return self.watermark()
 
     def commit(self) -> Watermark:
@@ -131,8 +165,20 @@ class RecordRepository:
     def commit_through(self, seq: int) -> Watermark:
         """Move the commit watermark up to ``seq``."""
 
+        if seq > self._durable_seq:
+            raise NotDurableError(
+                "cannot commit past the durable watermark",
+                requested=seq,
+                durable=self._durable_seq,
+            )
         if seq < self._committed_seq:
             raise RecordError("the commit watermark never moves backwards", requested=seq, committed=self._committed_seq)
+        if seq == self._committed_seq:
+            return self.watermark()
+        self._append_entry(
+            JournalEntry(entry_type=ENTRY_COMMIT, tick=self._clock.now(), seq=seq)
+        )
+        self._backend.flush_now()
         self._committed_seq = seq
         return self.watermark()
 
@@ -144,15 +190,18 @@ class RecordRepository:
         self.commit_through(record.seq)
         return record
 
+    def _committed(self) -> tuple[Record, ...]:
+        return tuple(self._records[: self._committed_seq])
+
     def visible(self) -> tuple[Record, ...]:
         """Return the committed, non tombstoned records."""
 
-        return effective_records(self._records)
+        return effective_records(self._committed())
 
     def committed_records(self) -> tuple[Record, ...]:
         """Return every committed record, tombstones included."""
 
-        return tuple(self._records)
+        return self._committed()
 
     def all_records(self) -> tuple[Record, ...]:
         return tuple(self._records)
