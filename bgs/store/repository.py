@@ -78,9 +78,27 @@ class RecordRepository:
         return self._snapshots
 
     def _load_backend(self) -> None:
+        """Rebuild the durable and commit watermarks from the journal.
+
+        ``append`` entries rebuild the record list up to the last durable
+        watermark.  ``durable`` and ``commit`` entries say how far the previous
+        run really got: anything past the durable marker never survived a
+        flush and anything between the two markers is durable but still
+        unconfirmed, so it stays hidden until someone commits it.
+        """
+
         for entry in self._backend.read():
             if entry.entry_type == ENTRY_APPEND and entry.record is not None:
                 self._records.append(entry.record)
+            elif entry.entry_type == ENTRY_DURABLE and entry.seq is not None:
+                self._durable_seq = max(self._durable_seq, entry.seq)
+            elif entry.entry_type == ENTRY_COMMIT and entry.seq is not None:
+                self._committed_seq = max(self._committed_seq, entry.seq)
+        # A commit cannot outlive durability; truncate defensively if a marker
+        # pair ever lands on disk in an unexpected order.
+        self._committed_seq = min(self._committed_seq, self._durable_seq)
+        if len(self._records) > self._durable_seq:
+            del self._records[self._durable_seq :]
 
     def _append_entry(self, entry: JournalEntry) -> None:
         self._backend.append(entry)
@@ -114,13 +132,28 @@ class RecordRepository:
         )
         self._records.append(record)
         self._append_entry(JournalEntry(entry_type=ENTRY_APPEND, tick=record.tick, record=record))
-        self._committed_seq = record.seq
         return record
 
     def flush(self) -> Watermark:
-        """Make every staged record durable."""
+        """Make every staged record durable.
 
+        The records and the durable watermark entry are flushed together, so a
+        reader reopening the backend either sees both (records durable) or
+        neither (records still pending).
+        """
+
+        staged = self.staged_records()
+        if not staged:
+            return self.watermark()
+        self._append_entry(
+            JournalEntry(
+                entry_type=ENTRY_DURABLE,
+                tick=self._clock.now(),
+                seq=staged[-1].seq,
+            )
+        )
         self._backend.flush_now()
+        self._durable_seq = staged[-1].seq
         return self.watermark()
 
     def commit(self) -> Watermark:
@@ -133,7 +166,18 @@ class RecordRepository:
 
         if seq < self._committed_seq:
             raise RecordError("the commit watermark never moves backwards", requested=seq, committed=self._committed_seq)
-        self._committed_seq = seq
+        if seq > self._durable_seq:
+            raise NotDurableError(
+                "cannot commit past the durable watermark",
+                requested=seq,
+                durable=self._durable_seq,
+            )
+        if seq != self._committed_seq:
+            self._append_entry(
+                JournalEntry(entry_type=ENTRY_COMMIT, tick=self._clock.now(), seq=seq)
+            )
+            self._backend.flush_now()
+            self._committed_seq = seq
         return self.watermark()
 
     def publish(self, kind: str, origin: str, generation: int, payload: Mapping[str, Any]) -> Record:
@@ -147,12 +191,13 @@ class RecordRepository:
     def visible(self) -> tuple[Record, ...]:
         """Return the committed, non tombstoned records."""
 
-        return effective_records(self._records)
+        committed = self._records[: self._committed_seq]
+        return effective_records(committed)
 
     def committed_records(self) -> tuple[Record, ...]:
         """Return every committed record, tombstones included."""
 
-        return tuple(self._records)
+        return tuple(self._records[: self._committed_seq])
 
     def all_records(self) -> tuple[Record, ...]:
         return tuple(self._records)
@@ -223,7 +268,7 @@ class RecordRepository:
             validity=validity,
         )
         self._snapshots.save(snapshot)
-        self._snapshot_seq = advance_watermark(self._snapshot_seq, snapshot.watermark_seq)
+        self._snapshot_seq = max(self._snapshot_seq, snapshot.watermark_seq)
         return snapshot
 
     def restore(self, now: int) -> RestoreReport:

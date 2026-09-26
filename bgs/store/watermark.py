@@ -22,3 +22,8 @@ class Watermark:
             "snapshot_seq": self.snapshot_seq,
             "tick": self.tick,
         }
+
+    def lag(self) -> int:
+        """Records that are durable but still waiting for a commit."""
+
+        return self.durable_seq - self.committed_seq
